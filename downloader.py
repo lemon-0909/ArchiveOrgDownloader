@@ -9,19 +9,22 @@ import os
 import time
 import threading
 from tqdm import tqdm
+from bs4 import BeautifulSoup
+import json
 
 loanUrl = "https://archive.org/services/loans/loan"
+detailsUrl = "https://archive.org/details/"
 
 bookId = None
-page_start = None
-page_end = None
-loanToken = ""
+loanToken = None
 cookies = {}
+item_dir = None
+item_server = None
 
 def build_book_reader_url(page_num):
     return (
-        f"https://ia800502.us.archive.org/BookReader/BookReaderImages.php"
-        f"?zip=/16/items/{bookId}/{bookId}_jp2.zip"
+        f"https://{item_server}/BookReader/BookReaderImages.php"
+        f"?zip={item_dir}/{bookId}_jp2.zip"
         f"&file={bookId}_jp2/{bookId}_{page_num:04}.jp2"
         f"&id={bookId}"
         f"&scale=4"
@@ -37,7 +40,7 @@ def payload(action):
 def get_cookies(include_loan_token=False):
 
     if not cookies.get("loggedInSig") or not cookies.get("loggedInUser"):
-        handle_error("Missing auth cookies in files")
+        handle_error("Missing required authentication cookies.")
 
     cookie_data = {
         "logged-in-sig": cookies["loggedInSig"],
@@ -55,6 +58,10 @@ def handle_error(msg, e=None):
     print(f"[ERROR] {msg}")
     if e:
         print(f"Details: {e}")
+
+    # Return book if needed
+    return_book()
+
     sys.exit(1)
 
 def decrypt(data, aesKey, counter):
@@ -113,64 +120,20 @@ def parse_args():
 
     return parser.parse_args()
 
-def main():
-    global bookId
-    global page_start
-    global page_end
-    global loanToken
-    global cookies
+def return_book():
+    if loanToken:
+        try:
+            response = requests.post(loanUrl, data=payload("return_loan"), cookies=get_cookies())
+            if response.status_code == 200:
+                print("Book successfully returned!")
+            else:
+                print("[WARN] Failed to return book")
+        except Exception as e:
+            print(f"[WARN] Exception during return: {e}")
 
-    args = parse_args()
-    bookId = args.book_id
-    page_start = args.page_start
-    page_end = args.page_end
-    cookies_file = args.cookies
-
-    if page_start <= 0 or page_end < page_start:
-        handle_error("Invalid page range")
-
-    # Create pages folder if it doesn't exist in project directory
-    folder_root = "pages"
-    os.makedirs(folder_root, exist_ok=True)
-
-    # Create folder to store all the book pages, and nest it to root folder
-    folder_name = os.path.join(folder_root, bookId)
-    os.makedirs(folder_name, exist_ok=True)
-    
-    # Extract the authentication cookies from file
-    with open(cookies_file) as f:
-        for line in f:
-            if '=' in line:
-                key, value = line.strip().split('=', 1)
-                cookies[key] = value
-
-
-    # Initiate borrowing the book
-    response = requests.post(loanUrl, data=payload("browse_book"), cookies=get_cookies())
-
-    print("Status Code:", response.status_code)
-    print("Response Body:")
-    print(response.text)
-
-    # Initial loan token request
-    response = requests.post(loanUrl, data=payload("create_token"), cookies=get_cookies())
-
-    print("Status Code:", response.status_code)
-    print("Response Body:")
-    print(response.text)
-
-    data = response.json()
-    if data.get("success") == True:
-        loanToken = data.get("token")
-
-        # Start background thread to refresh loan token every 2 mins
-        token_thread = threading.Thread(target=refresh_loan_token, daemon=True)
-        token_thread.start()
-
-        # Loop through each page and download it
-
-        for page_num in tqdm(range(page_start, page_end + 1), desc="Downloading pages", unit="page"):
-            response = requests.get(build_book_reader_url(page_num), headers=headers(page_num), cookies=get_cookies(True))
+def download_pages(page_start, page_end, folder_name, loan_status):
+    for page_num in tqdm(range(page_start, page_end + 1), desc="Downloading pages", unit="page"):
+            response = requests.get(build_book_reader_url(page_num), headers=headers(page_num), cookies=get_cookies(loan_status))
             #print("Status Code:", response.status_code)
 
             if response.status_code != 200:
@@ -207,10 +170,125 @@ def main():
             with open(file_path, "wb") as f:
                 f.write(final_image)
 
-            time.sleep(0.5) # Rate-limit
+            time.sleep(0.2) # Rate-limit
+
+def main():
+    global bookId
+    global loanToken
+    global cookies
+    global item_dir
+    global item_server
+
+    args = parse_args()
+    bookId = args.book_id
+    page_start = args.page_start
+    page_end = args.page_end
+    cookies_file = args.cookies
+
+    if page_start <= 0 or page_end < page_start:
+        handle_error("Invalid page range")
+
+    # Create pages folder if it doesn't exist in project directory
+    folder_root = "pages"
+    os.makedirs(folder_root, exist_ok=True)
+
+    # Create folder to store all the book pages, and nest it to root folder
+    folder_name = os.path.join(folder_root, bookId)
+    os.makedirs(folder_name, exist_ok=True)
+    
+    # Extract the authentication cookies from file
+    with open(cookies_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if '=' in line:
+                key, value = line.split('=', 1)
+                cookies[key] = value
+    
+    if not cookies.get("loggedInSig") or not cookies.get("loggedInUser"):
+        handle_error("Missing required authentication cookies")
+
+    # Fetch details of book to parse servers and file directory in server
+    response = requests.get(detailsUrl + bookId, cookies=get_cookies())
+    #print("Status Code:", response.status_code)
+
+    if response.status_code != 200:
+        handle_error("Failed to fetch book details")
+
+    html = response.text
+    soup = BeautifulSoup(html, 'html.parser')
+
+    metadata = soup.find(class_="js-ia-metadata")
+    if not metadata:
+        handle_error("js-ia-metadata element not found in HTML")
+
+    value = metadata.get("value")
+    if not value:
+        handle_error("js-ia-metadata element missing 'value' attribute")
+
+    details_json = json.loads(value)
+    item_server = details_json["server"]
+    item_dir = details_json["dir"]
+
+    if not item_server or not item_dir:
+        handle_error("Server or directory info missing in metadata")
+
+    print("Server found:", item_server)
+    print("Book directory found:", item_dir)
+
+    # Initiate borrowing the book
+    response = requests.post(loanUrl, data=payload("browse_book"), cookies=get_cookies())
+
+    #print("Status Code:", response.status_code)
+    #print("Response Body:", response.text)
+
+    if response.status_code != 200:
+        print("[WARN] Could not initiate book loan. Proceeding without loan.")
+        try:
+            download_pages(page_start, page_end, folder_name, False)
+        except Exception as e:
+            handle_error("An unexpected error occurred during download", e)
+        else:
+            print("Download completed!")
+        finally:
+            return_book()
+        return
+
+    # Initial loan token request
+    response = requests.post(loanUrl, data=payload("create_token"), cookies=get_cookies())
+
+    #print("Status Code:", response.status_code)
+    print("Response Body:", response.text)
+
+    if response.status_code != 200:
+        handle_error("Failed to create initial loan token")
+
+    data = response.json()
+    if data.get("success") == True:
+        loanToken = data.get("token")
+
+        # Start background thread to refresh loan token every 2 mins
+        token_thread = threading.Thread(target=refresh_loan_token, daemon=True)
+        token_thread.start()
+
+        # Loop through each page and download it 
+
+        try:
+            download_pages(page_start, page_end, folder_name, True)
+        except Exception as e:
+            handle_error("An unexpected error occurred during download", e)
+        else:
+            print("Download completed!")
+        finally:
+            return_book()
     else:
         handle_error("Failed to create initial loan token")
 
     
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user. Exiting cleanly.")
+        sys.exit(0)
